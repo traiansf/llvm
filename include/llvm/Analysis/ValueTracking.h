@@ -16,6 +16,7 @@
 #define LLVM_ANALYSIS_VALUETRACKING_H
 
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/IR/Instruction.h"
 #include "llvm/Support/DataTypes.h"
 
 namespace llvm {
@@ -28,6 +29,7 @@ namespace llvm {
   class AssumptionCache;
   class DominatorTree;
   class TargetLibraryInfo;
+  class LoopInfo;
 
   /// Determine which bits of V are known to be either zero or one and return
   /// them in the KnownZero/KnownOne bit sets.
@@ -46,6 +48,11 @@ namespace llvm {
   /// \p KnownZero the set of bits that are known to be zero
   void computeKnownBitsFromRangeMetadata(const MDNode &Ranges,
                                          APInt &KnownZero);
+  /// Returns true if LHS and RHS have no common bits set.
+  bool haveNoCommonBitsSet(Value *LHS, Value *RHS, const DataLayout &DL,
+                           AssumptionCache *AC = nullptr,
+                           const Instruction *CxtI = nullptr,
+                           const DominatorTree *DT = nullptr);
 
   /// ComputeSignBit - Determine whether the sign bit is known to be zero or
   /// one.  Convenience wrapper around computeKnownBits.
@@ -176,16 +183,49 @@ namespace llvm {
     return GetUnderlyingObject(const_cast<Value *>(V), DL, MaxLookup);
   }
 
-  /// GetUnderlyingObjects - This method is similar to GetUnderlyingObject
-  /// except that it can look through phi and select instructions and return
-  /// multiple objects.
+  /// \brief This method is similar to GetUnderlyingObject except that it can
+  /// look through phi and select instructions and return multiple objects.
+  ///
+  /// If LoopInfo is passed, loop phis are further analyzed.  If a pointer
+  /// accesses different objects in each iteration, we don't look through the
+  /// phi node. E.g. consider this loop nest:
+  ///
+  ///   int **A;
+  ///   for (i)
+  ///     for (j) {
+  ///        A[i][j] = A[i-1][j] * B[j]
+  ///     }
+  ///
+  /// This is transformed by Load-PRE to stash away A[i] for the next iteration
+  /// of the outer loop:
+  ///
+  ///   Curr = A[0];          // Prev_0
+  ///   for (i: 1..N) {
+  ///     Prev = Curr;        // Prev = PHI (Prev_0, Curr)
+  ///     Curr = A[i];
+  ///     for (j: 0..N) {
+  ///        Curr[j] = Prev[j] * B[j]
+  ///     }
+  ///   }
+  ///
+  /// Since A[i] and A[i-1] are independent pointers, getUnderlyingObjects
+  /// should not assume that Curr and Prev share the same underlying object thus
+  /// it shouldn't look through the phi above.
   void GetUnderlyingObjects(Value *V, SmallVectorImpl<Value *> &Objects,
-                            const DataLayout &DL, unsigned MaxLookup = 6);
+                            const DataLayout &DL, LoopInfo *LI = nullptr,
+                            unsigned MaxLookup = 6);
 
   /// onlyUsedByLifetimeMarkers - Return true if the only users of this pointer
   /// are lifetime markers.
   bool onlyUsedByLifetimeMarkers(const Value *V);
 
+  /// isDereferenceablePointer - Return true if this is always a dereferenceable 
+  /// pointer.
+  ///
+  /// Test if this value is always a pointer to allocated and suitably aligned
+  /// memory for a simple load or store.
+  bool isDereferenceablePointer(const Value *V, const DataLayout &DL);
+  
   /// isSafeToSpeculativelyExecute - Return true if the instruction does not
   /// have any effects besides calculating the result and does not have
   /// undefined behavior.
@@ -228,6 +268,35 @@ namespace llvm {
                                                AssumptionCache *AC,
                                                const Instruction *CxtI,
                                                const DominatorTree *DT);
+  
+  /// \brief Specific patterns of select instructions we can match.
+  enum SelectPatternFlavor {
+    SPF_UNKNOWN = 0,
+    SPF_SMIN,                   // Signed minimum
+    SPF_UMIN,                   // Unsigned minimum
+    SPF_SMAX,                   // Signed maximum
+    SPF_UMAX,                   // Unsigned maximum
+    SPF_ABS,                    // Absolute value
+    SPF_NABS                    // Negated absolute value
+  };
+  /// Pattern match integer [SU]MIN, [SU]MAX and ABS idioms, returning the kind
+  /// and providing the out parameter results if we successfully match.
+  ///
+  /// If CastOp is not nullptr, also match MIN/MAX idioms where the type does
+  /// not match that of the original select. If this is the case, the cast
+  /// operation (one of Trunc,SExt,Zext) that must be done to transform the
+  /// type of LHS and RHS into the type of V is returned in CastOp.
+  ///
+  /// For example:
+  ///   %1 = icmp slt i32 %a, i32 4
+  ///   %2 = sext i32 %a to i64
+  ///   %3 = select i1 %1, i64 %2, i64 4
+  ///
+  /// -> LHS = %a, RHS = i32 4, *CastOp = Instruction::SExt
+  ///
+  SelectPatternFlavor matchSelectPattern(Value *V, Value *&LHS, Value *&RHS,
+                                         Instruction::CastOps *CastOp = nullptr);
+
 } // end namespace llvm
 
 #endif
